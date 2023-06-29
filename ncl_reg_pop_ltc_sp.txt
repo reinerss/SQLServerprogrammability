@@ -1,0 +1,78 @@
+/*------------------------------------------------------------------------------------------------------ 
+Description   	Create a stored procedure to generate a complete list of patients QOF LTCs
+		for NCL registered patients, with IMD and ethnicity included.
+		This uses another stored procedure to generate the population list
+		and then looks up the fact tables to identify QOF LTCs for these patients
+		The accuracy of these LTC numbers has not been verified
+		but as they are derived from GP data they will suffer from the limitation
+		around its availablity eg no data for Barnet
+		creates a global temporary table ##ncl_reg_pop_ltc
+		
+                 
+Date		Version		Author		Comment
+---------------------------------------------------------------------------------------------------------
+06-Jun-2023	1.0		SR		First version
+--------------------------------------------------------------------------------------------------------- */
+create procedure dbo.SR_ncl_reg_pop_ltc
+as
+
+
+--first clearing out the temporary table and the final table and population table (if it exists)
+drop table if exists #temp_qof_ltc
+drop table if exists ##ncl_reg_pop_ltc
+drop table if exists ##ncl_reg_pop
+
+exec dbo.SR_ncl_reg_pop
+
+
+
+drop table if exists #temp_qof_ltc
+
+SELECT fc.sk_patientid,
+lct.LifetimeConditionType,count(*) as num
+into #temp_qof_ltc
+FROM fact.patient.factlifetimecondition fc
+join ##ncl_reg_pop pop 
+on fc.SK_PatientID=pop.sk_patientid
+join fact.patient.DimLifetimeConditionType lct
+on fc.SK_LifetimeConditionTypeID=lct.SK_LifetimeConditionTypeID
+where lct.LifetimeConditionType like 'Qof%'
+group by fc.sk_patientid,lct.LifetimeConditionType
+
+
+DROP TABLE IF EXISTS ##ncl_reg_pop_ltc
+
+SELECT * into ##ncl_reg_pop_ltc FROM   
+(
+    SELECT pop.*,LifetimeConditionType,num
+            FROM ##ncl_reg_pop pop
+			LEFT JOIN  #temp_qof_ltc ltc
+			on pop.sk_patientid=ltc.SK_PatientID) t 
+PIVOT(
+    count(num) 
+    FOR LifetimeConditionType IN (
+        [QoF Asthma], 
+		[QoF Atrial Fibrillation],
+		[QoF Cancer],
+        [QoF CKD (Stage 1-2)],
+		[QoF CKD (Stage 3-5)],
+        [QoF CHD], 
+		[QoF COPD], 
+		[QoF Dementia],
+		[QoF Depression],
+		[QoF Diabetes],
+		[QoF Epilepsy],
+		[QoF Heart Failure],
+		[QoF Hypertension],
+		[QoF Learning Disabilities],
+		[QoF Mental Health],
+        [QoF Osteoperosis], 
+        [QoF PAD], 
+        [QoF Rheumatoid Arthritis], 
+        [QoF Stroke])
+) AS pivot_table;
+
+
+ Go
+
+ 
