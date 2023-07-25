@@ -1,0 +1,262 @@
+/*------------------------------------------------------------------------------------------------------ 
+Description   	Create a stored procedure to generate a complete list of patients resident 
+		within NCL LSOAs , with IMD and ethnicity included
+		At a specific date in the past (included as a parameter)
+		This is used as a denominator for mortality calculations
+		Ethnicity recoded using other sources (most recent record method)
+		The output table is a temporary table #tem_reg_pop
+		Note that derivation of borough could be improved?
+                 
+Date		Version		Author		Comment
+---------------------------------------------------------------------------------------------------------
+06-Jun-2023	1.0		SR		First version
+24-Jul-2023	2.0		SR		Second version. Based on NCL Reg sql, amended for residence
+25-Jul-2023	3.0		SR		Third version. This one takes a cut at a specific date
+--------------------------------------------------------------------------------------------------------- */
+USE data_lab_sbi
+
+GO
+
+
+create procedure dbo.SR_ncl_res_pop_date @pop_date DATE	
+as
+
+--first dropping temp table and the final global temp table prior to execution
+--makes this procedure repeatable
+
+drop table if exists #temp_gp_ethnicity;
+drop table if exists ##ncl_res_pop;
+
+--creating temp table for ethnicities held in fact table
+
+SELECT distinct [SK_PatientID],       fp.[SK_EthnicityID],
+eth.BK_EthnicityCode ,
+eth.EthnicityHESCode,
+eth.ethnicitydesc,
+eth.EthnicityDesc2
+into #temp_gp_ethnicity
+        FROM [Fact].[Patient].[FactProfile] fp
+		left join dictionary.dbo.ethnicity eth
+		  on fp.SK_EthnicityID=eth.SK_EthnicityID
+		    where SK_DataSourceID=5
+  and PeriodEnd='9999-12-31' and DateOfDeath is null
+  and isnull(eth.ethnicityhescode,'Z') not in ('Z','X','9')
+
+  --creating main table. this has IMD
+  --and ethnicity 
+  --now includes borough and run date
+
+    SELECT distinct 
+  @pop_date as census_date,
+utla18nm as borough,
+fpra.sk_patientid,
+  fpro.dateofbirth dob,
+datediff(year,fpro.dateofbirth,getdate()) age,
+fpro.sk_genderid,
+round(datediff(year,fpro.dateofbirth,getdate())/5,0,1) as age_band,
+org.Organisation_Name practice_name,
+org.Organisation_Code practice_code,
+fres.SK_OutputAreaID,
+imd.Index_of_Multiple_Deprivation_Decile,
+gp_eth.SK_EthnicityID,
+gp_eth.BK_EthnicityCode as ethnic_code,
+gp_eth.EthnicityHESCode as ethnic_code_hes,
+gp_eth.ethnicitydesc,
+gp_eth.EthnicityDesc2,
+'FACT' as data_source
+into ##ncl_res_pop
+  FROM  [Fact].[Patient].[FactPractice] fpra
+  JOIN [Fact].[Patient].[FactProfile] fpro
+  on fpra.sk_patientid=fpro.sk_patientid
+  and @pop_date between fpra.PeriodStart and fpra.PeriodEnd
+  and (fpra.DateDetectedLeft is null or fpra.DatedetectedLeft>@pop_date)
+  and @pop_date between fpro.periodstart and fpro.PeriodEnd
+  and (fpro.dateofdeath is null or fpro.DateOfDeath>@pop_date)
+  and fpra.SK_DataSourceID=7 and fpro.SK_DataSourceID=7
+  JOIN FACT.PATIENT.Factresidence fres
+  on fpra.SK_PatientID=fres.sk_patientid
+  and fres.PeriodEnd='9999-12-31' and fres.DateDetectedEnd is null
+        left join Dictionary.dbo.OutputArea oa
+  on fres.SK_OutputAreaID=oa.SK_OutputAreaID
+  left join   Data_Lab_SBI.rd.imd2019 imd
+  on oa.OACode=imd.LSOA_code_2011
+    left join #temp_gp_ethnicity gp_eth
+  on fpra.sk_patientid=gp_eth.SK_PatientID
+left join Data_Lab_SBI.SR.lsoa2011_la_lookup la
+  on oa.oacode=la.lsoa11cd
+  left join dictionary.dbo.organisation org
+  on fpra.SK_OrganisationID=org.sk_organisationid
+    where utla18nm
+in ('Barnet','Camden','Haringey','Enfield','Islington') 
+
+
+  ------section to code up ethnicity from various sources- gp,ip,ae,op
+--first of all the gp data. these are coded to snomed so a table is needed to convert these
+--to the sk_ids used  in the dictionary
+--first creating a list of snomed codes
+drop table if exists #ethnic_snomed
+
+SELECT
+ [SK_SnomedID]
+,C.[SK_SnomedConceptID]
+,C.[SK_SnomedDescriptionID]
+,C2.[PreferredTerm],
+sm.snomedcode,
+sm.Ethnicity open_safely_ethnicity,
+sm.GROUPING_16,
+sm.GROUPING_6,
+sk_ethnicityid
+INTO #ethnic_snomed
+FROM [Dictionary].[Snomed].[Code] C
+LEFT JOIN [Dictionary].[Snomed].[Concept] C2 ON C.[SK_SnomedConceptID] = C2.[SK_SnomedConceptID]
+JOIN data_lab_sbi.dbo.SR_snomed_ethnicity2 sm
+on C.[SK_SnomedConceptID]=sm.snomedcode
+
+drop table if exists #temp_ethnicity_gp 
+
+select distinct pop.sk_patientid,
+eth.sk_ethnicityid,eth.BK_EthnicityCode,eth.EthnicityHESCode,eth.EthnicityDesc,eth.EthnicityDesc2,
+ev.eventdate,
+rank() over (partition by pop.sk_patientid order by ev.eventdate desc) eth_rank
+into #temp_ethnicity_gp 
+from 
+##ncl_res_pop pop
+join gp.dbo.event ev
+on pop.SK_PatientID=ev.SK_PatientID
+join #ethnic_snomed sm
+on ev.sk_snomedid=sm.sk_snomedid
+join Dictionary.dbo.ethnicity eth
+on sm.sk_ethnicityid=eth.SK_EthnicityID
+where pop.SK_PatientID<>1
+and isnull(eth.ethnicityhescode,'Z') not in ('Z','X','9')
+and eth.SK_EthnicityID<>1
+and (pop.ethnic_code='-1' or pop.ethnic_code_hes in ('Z','X','9') or pop.ethnic_code is null)
+
+--updating main table from gp records created above
+update cl  set
+cl.sk_ethnicityid=eth.sk_ethnicityid,
+cl.ethnic_code=eth.bk_ethnicitycode,
+cl.ethnic_code_hes=eth.ethnicityhescode,
+cl.ethnicitydesc=eth.ethnicitydesc,
+cl.ethnicitydesc2=eth.ethnicitydesc2,
+data_source='GP'
+from ##ncl_res_pop cl inner join #temp_ethnicity_gp  eth
+on cl.sk_patientid=eth.sk_patientid
+where eth.eth_rank=1
+
+
+--inpatient data
+drop table if exists #temp_ethnicity_ip 
+
+select distinct cl.sk_patientid,
+ep.sk_ethnicityid,eth.BK_EthnicityCode,eth.EthnicityHESCode,eth.EthnicityDesc,eth.EthnicityDesc2,
+ed.admissiondate,ed.dischargedate,
+rank() over (partition by cl.sk_patientid order by ed.admissiondate desc) eth_rank
+into #temp_ethnicity_ip
+from sus.ip.EncounterPatient ep join
+sus.IP.encounterdetail ed
+on ep.SK_EncounterID=ed.SK_EncounterID
+join dictionary.dbo.Ethnicity eth
+on ep.SK_EthnicityID=eth.SK_EthnicityID
+join ##ncl_res_pop cl
+on ed.SK_PatientID=cl.SK_PatientID
+where cl.SK_PatientID<>1
+and isnull(eth.ethnicityhescode,'Z') not in ('Z','X','9')
+and eth.SK_EthnicityID<>1
+and (cl.ethnic_code='-1' or cl.ethnic_code_hes in ('Z','X','9') or cl.ethnic_code is null)
+
+--updating main table (IP)
+update cl  set
+cl.sk_ethnicityid=eth.sk_ethnicityid,
+cl.ethnic_code=eth.bk_ethnicitycode,
+cl.ethnic_code_hes=eth.ethnicityhescode,
+cl.ethnicitydesc=eth.ethnicitydesc,
+cl.ethnicitydesc2=eth.ethnicitydesc2,
+data_source='IP'
+from ##ncl_res_pop cl inner join #temp_ethnicity_ip eth
+on cl.sk_patientid=eth.sk_patientid
+where eth.eth_rank=1
+
+--outpatients
+drop table if exists #temp_ethnicity_op
+
+select distinct cl.sk_patientid,
+ep.sk_ethnicityid,eth.BK_EthnicityCode,eth.EthnicityHESCode,eth.EthnicityDesc,eth.EthnicityDesc2,
+ed.encounterstartdatetime,
+rank() over (partition by cl.sk_patientid order by ed.encounterstartdatetime desc) eth_rank
+into #temp_ethnicity_op
+from sus.op.EncounterPatient ep join
+sus.op.encounterdetail ed
+on ep.SK_EncounterID=ed.SK_EncounterID
+join dictionary.dbo.Ethnicity eth
+on ep.SK_EthnicityID=eth.SK_EthnicityID
+join ##ncl_res_pop cl
+on ed.SK_PatientID=cl.SK_PatientID
+where cl.SK_PatientID<>1
+and isnull(eth.ethnicityhescode,'Z') not in ('Z','X','9')
+and eth.SK_EthnicityID<>1
+and (cl.ethnic_code='-1' or cl.ethnic_code_hes in ('Z','X','9') or cl.ethnic_code is null)
+
+--updating main table (outpatients)
+update cl  set
+cl.sk_ethnicityid=eth.sk_ethnicityid,
+cl.ethnic_code=eth.bk_ethnicitycode,
+cl.ethnic_code_hes=eth.ethnicityhescode,
+cl.ethnicitydesc=eth.ethnicitydesc,
+cl.ethnicitydesc2=eth.ethnicitydesc2,
+data_source='OP'
+from ##ncl_res_pop cl inner join #temp_ethnicity_op eth
+on cl.sk_patientid=eth.sk_patientid
+where eth.eth_rank=1
+
+--ae data
+drop table if exists #temp_ethnicity_ae
+
+select distinct cl.sk_patientid,
+ep.sk_ethnicityid,eth.BK_EthnicityCode,eth.EthnicityHESCode,eth.EthnicityDesc,eth.EthnicityDesc2,
+ed.encounterstartdatetime,
+rank() over (partition by cl.sk_patientid order by ed.encounterstartdatetime desc) eth_rank
+into #temp_ethnicity_ae
+from sus.ae.EncounterPatient ep join
+sus.ae.encounterdetail ed
+on ep.SK_EncounterID=ed.SK_EncounterID
+join dictionary.dbo.Ethnicity eth
+on ep.SK_EthnicityID=eth.SK_EthnicityID
+join ##ncl_res_pop cl
+on ed.SK_PatientID=cl.SK_PatientID
+where cl.SK_PatientID<>1
+and isnull(eth.ethnicityhescode,'Z') not in ('Z','X','9')
+and eth.SK_EthnicityID<>1
+and (cl.ethnic_code='-1' or cl.ethnic_code_hes in ('Z','X','9') or ethnic_code is null)
+
+--updating main table (ae)
+update cl  set
+cl.sk_ethnicityid=eth.sk_ethnicityid,
+cl.ethnic_code=eth.bk_ethnicitycode,
+cl.ethnic_code_hes=eth.ethnicityhescode,
+cl.ethnicitydesc=eth.ethnicitydesc,
+cl.ethnicitydesc2=eth.ethnicitydesc2,
+data_source='AE'
+from ##ncl_res_pop cl inner join #temp_ethnicity_ae eth
+on cl.sk_patientid=eth.sk_patientid
+where eth.eth_rank=1
+
+----now updating any unknowns to the unknown codes
+update ##ncl_res_pop
+set SK_EthnicityID=58,
+ethnic_code='Z',
+ethnic_code_hes='Z',
+EthnicityDesc='NOT STATED',
+EthnicityDesc2='Not stated'
+where SK_EthnicityID=1 or ethnic_code_hes is null
+
+
+
+
+  Go
+
+
+
+
+
+  
